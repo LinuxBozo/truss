@@ -1,0 +1,100 @@
+#!/bin/env python3
+
+import csv
+import sys
+import re
+import pytz
+from datetime import datetime, timedelta
+
+
+FIELDNAMES = ["Timestamp","Address","ZIP","FullName","FooDuration","BarDuration","TotalDuration","Notes"]
+
+
+class Normalizer:
+
+    def process_Timestamp(self, line):
+        """
+        The Timestamp column should be formatted in RFC3339 format.
+        The Timestamp column should be assumed to be in US/Pacific time; please convert it to US/Eastern.
+        """
+        unaware_time = datetime.strptime(line['Timestamp'], '%m/%d/%y %I:%M:%S %p')
+
+        # Some of why I love python. Batteries included for timezone shenanigans (and DST)
+        pacific_time = pytz.timezone("US/Pacific").localize(unaware_time)
+        eastern_time = pacific_time.astimezone(pytz.timezone("US/Eastern"))
+        
+        line['Timestamp'] = eastern_time.isoformat()
+        return line
+
+
+    def process_ZIP(self, line):
+        """
+        All ZIP codes should be formatted as 5 digits. If there are less than 5 digits, assume 0 as the prefix.
+        """
+        line['ZIP'] = line['ZIP'].zfill(5)[:5]
+        return line
+
+    def process_FullName(self, line):
+        """
+        The FullName column should be converted to uppercase. There will be non-English names.
+        """
+        # Yay, again, python is smart about this
+        line['FullName'] = line['FullName'].upper()
+        return line
+
+    def process_TotalDuration(self, line):
+        """
+        The TotalDuration column is filled with garbage data. For each row, please replace the value of
+        TotalDuration with the sum of FooDuration and BarDuration.
+        """
+        # Make sure we process Foo/BarDuration first so we can then use that for TotalDuration
+        line['FooDuration'] = self.__process_duration(line['FooDuration'])
+        line['BarDuration'] = self.__process_duration(line['BarDuration'])
+        line['TotalDuration'] = line['FooDuration'] + line['BarDuration']
+        return line
+
+    def process_nothing(self, line):
+        """
+        Dummy method that does absolutely nothing. Used mainly for Notes and Address fields
+        but also for Foo/BarDuration so we can force processing of those with TotalDuration
+        This is to support our dynamic method calling in normalize_stdin
+        """
+        return line
+
+    def __process_duration(self, duration):
+        """ Private method to process duration data to seconds"""
+        # use a regex to parse out digits
+        t = re.findall(r"[0-9]+", duration)
+        # make sure each group match is converted to int
+        t = [int(item) for item in t]
+        delta = timedelta(hours=t[0], minutes=t[1], seconds=t[2], microseconds=t[3])
+        return delta.total_seconds()
+
+    def normalize_stdin(self):
+        # set up our output
+        outwriter = csv.DictWriter(sys.stdout, FIELDNAMES)
+        outwriter.writeheader()
+
+        # Use a trick to open enabled in py3, 0 == sys.stdin, replacing invalid utf-8 chars
+        with open(0, encoding="utf-8", errors='replace') as csv_file:
+            # Start reading in CSV format
+            reader = csv.DictReader(csv_file)
+            for line in reader:
+                error = False
+                for field in FIELDNAMES:
+                    # Let's now process for each field special rules using dynamic method lookup
+                    try:
+                        line = getattr(self, 'process_{}'.format(field), self.process_nothing)(line)
+                    except:
+                        # Catching all errors is bad, mmkay, but I'm feeling lazy at the moment
+                        print("WARNING: Invalid data found, dropping row", file=sys.stderr)
+                        error = True
+                        break
+                if not error:
+                    outwriter.writerow(line)
+
+
+if __name__ == '__main__':
+    """ We were called from the CLI directly, so instantiate and run our normalize """
+    n = Normalizer()
+    n.normalize_stdin()
